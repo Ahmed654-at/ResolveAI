@@ -1,0 +1,13 @@
+# Virtual environment
+.venv/
+
+# Secrets — never commit
+.env
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated database (rebuild with: python data/seed.py)
+data/resolveai.db
