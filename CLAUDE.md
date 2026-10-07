@@ -131,7 +131,7 @@ pytest                           # run tests
 - [x] 1. Project setup, `requirements.txt`, `.env.example`
 - [x] 2. `seed.py` with the fake database and `refund_policy.md`
 - [x] 3. First tool, `lookup_order`, plus a minimal agent loop that can call it
-- [ ] 4. The other read tools
+- [x] 4. The other read tools
 - [ ] 5. `rules.py` and `create_refund` / `escalate_to_human`
 - [ ] 6. Step limit, loop detection, logging
 - [ ] 7. Streamlit dashboard
