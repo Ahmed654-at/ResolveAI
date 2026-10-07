@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from agent import tools
@@ -89,6 +91,78 @@ def test_fraud_check_not_found(test_db):
 
 # --- registry -----------------------------------------------------------------
 
-def test_all_read_tools_registered():
+def test_all_tools_registered():
     names = {schema["function"]["name"] for schema in tools.TOOL_SCHEMAS}
-    assert names == {"lookup_order", "get_customer_history", "search_refund_policy", "fraud_check"}
+    assert names == {"lookup_order", "get_customer_history", "search_refund_policy", "fraud_check",
+                     "create_refund", "escalate_to_human"}
+
+
+def test_case_id_is_not_exposed_to_the_model():
+    schema = next(s for s in tools.TOOL_SCHEMAS if s["function"]["name"] == "escalate_to_human")
+    assert "case_id" not in schema["function"]["parameters"]["properties"]
+
+
+# --- create_refund ------------------------------------------------------------
+
+def count(db_path, sql, *params):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(sql, params).fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("order_id", [1, 7, 8, 10])
+def test_create_refund_allowed_scenarios(test_db, order_id):
+    amount = tools.lookup_order(order_id)["amount"]
+    assert tools.create_refund(order_id, amount)["status"] == "refunded"
+
+
+@pytest.mark.parametrize("order_id, expected_reason", [
+    (2, "auto-refund limit"),          # $250
+    (3, "outside the 30-day window"),  # 45 days
+    (4, "refunds in the last 90 days"),
+    (5, "fraud score"),                # new account + $900 (also over the limit)
+    (6, "not been delivered"),         # lost
+    (9, "outside the 30-day window"),  # 31 days
+    (11, "already been refunded"),
+    (12, "not been delivered"),        # still shipping
+])
+def test_create_refund_refused_scenarios(test_db, order_id, expected_reason):
+    amount = tools.lookup_order(order_id)["amount"]
+    result = tools.create_refund(order_id, amount)
+    assert result["status"] == "refused"
+    assert any(expected_reason in r for r in result["reasons"])
+
+
+def test_refused_refund_writes_nothing(test_db):
+    before = count(test_db, "SELECT COUNT(*) FROM refunds")
+    tools.create_refund(2, 250.0)
+    assert count(test_db, "SELECT COUNT(*) FROM refunds") == before
+
+
+def test_refund_writes_row_and_updates_count(test_db):
+    result = tools.create_refund(1, 40.0)
+    assert count(test_db, "SELECT decided_by FROM refunds WHERE id = ?", result["refund_id"]) == "agent"
+    assert count(test_db, "SELECT refunds_last_90_days FROM customers WHERE id = 1") == 1
+
+
+def test_cannot_refund_same_order_twice(test_db):
+    assert tools.create_refund(1, 40.0)["status"] == "refunded"
+    second = tools.create_refund(1, 40.0)
+    assert second["status"] == "refused"
+    assert "order has already been refunded" in second["reasons"]
+
+
+def test_create_refund_unknown_order(test_db):
+    assert tools.create_refund(999, 10.0)["status"] == "refused"
+
+
+# --- escalate_to_human --------------------------------------------------------
+
+def test_escalate_writes_to_queue(test_db):
+    result = tools.run_tool("escalate_to_human", '{"reason": "amount over $100", "order_id": 2}',
+                            case_id="case-test")
+    assert result["status"] == "escalated"
+    assert count(test_db, "SELECT case_id FROM escalations WHERE id = ?", result["escalation_id"]) == "case-test"
+    assert count(test_db, "SELECT status FROM escalations WHERE id = ?", result["escalation_id"]) == "open"

@@ -13,7 +13,7 @@ from agent import config
 
 TIMEOUT_SECONDS = 60
 ATTEMPTS = 3
-BACKOFF_SECONDS = 1  # waits 1s, then 2s, between attempts
+BACKOFF_SECONDS = 2  # waits 2s, then 4s, between attempts (overloads need a moment to clear)
 
 # max_retries=0: the SDK has its own hidden retries; we turn them off so ours are the only ones
 client = OpenAI(api_key=config.OPENROUTER_API_KEY, base_url=config.BASE_URL,
@@ -50,11 +50,17 @@ def chat(messages, tools=None):
         stats["calls"] += 1
         try:
             response = client.chat.completions.create(**kwargs)
+            # OpenRouter can return HTTP 200 with an error inside, e.g. "provider overloaded" (503)
+            error = getattr(response, "error", None)
             message = response.choices[0].message if response.choices else None
-            if message and (message.content or message.tool_calls):
+            if error:
+                stats["failures"] += 1
+                last_error = f"provider error: {error.get('message', error) if isinstance(error, dict) else error}"
+            elif message and (message.content or message.tool_calls):
                 return message
-            stats["empty"] += 1
-            last_error = "empty reply"
+            else:
+                stats["empty"] += 1
+                last_error = "empty reply"
         except openai.OpenAIError as e:  # timeouts, rate limits (429), server errors
             stats["failures"] += 1
             last_error = f"{type(e).__name__}: {e}"

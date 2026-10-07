@@ -7,10 +7,13 @@ to generate the JSON schema we send to the model, and to validate what the model
 import json
 import re
 import sqlite3
-from datetime import date
+from contextlib import contextmanager
+from datetime import date, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError
+
+from agent import rules
 
 DB_PATH = Path(__file__).parent.parent / "data" / "resolveai.db"
 POLICY_PATH = Path(__file__).parent.parent / "data" / "refund_policy.md"
@@ -25,12 +28,18 @@ class InvalidToolCall(Exception):
     """The model asked for a tool that doesn't exist, or sent bad arguments."""
 
 
+@contextmanager
 def connect():
+    """Open the database; save changes if everything worked, undo them if not, always close."""
     if not Path(DB_PATH).exists():
         raise FileNotFoundError(f"{DB_PATH} not found. Run: python data/seed.py")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # rows behave like dicts
-    return conn
+    try:
+        with conn:  # commit on success, rollback on error
+            yield conn
+    finally:
+        conn.close()
 
 
 # --- lookup_order -------------------------------------------------------------
@@ -169,6 +178,76 @@ def fraud_check(customer_id: int, order_id: int) -> dict:
     return {"risk_score": min(score, 100), "reasons": reasons or ["no risk signals found"]}
 
 
+# --- create_refund (WRITE) ----------------------------------------------------
+
+class CreateRefundArgs(BaseModel):
+    order_id: int = Field(gt=0)
+    amount: float = Field(description="Refund amount in dollars, normally the full order amount")
+
+
+def create_refund(order_id: int, amount: float) -> dict:
+    """Issue a refund, but only if rules.evaluate() allows it. Facts come from the database,
+    never from the model, so the model can't talk its way past the rules."""
+    amount = round(amount, 2)
+    with connect() as conn:
+        order = conn.execute(
+            "SELECT o.customer_id, o.amount, o.delivery_status, o.delivery_date, c.refunds_last_90_days"
+            " FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.id = ?",
+            (order_id,),
+        ).fetchone()
+        if order is None:
+            return {"status": "refused", "reasons": [f"order {order_id} not found"]}
+
+        already_refunded = conn.execute(
+            "SELECT COUNT(*) FROM refunds WHERE order_id = ? AND status IN ('approved', 'pending_review')",
+            (order_id,),
+        ).fetchone()[0] > 0
+        delivered = order["delivery_status"] == "delivered" and order["delivery_date"] is not None
+        facts = rules.RefundFacts(
+            amount=amount,
+            order_amount=order["amount"],
+            delivered=delivered,
+            days_since_delivery=(today() - date.fromisoformat(order["delivery_date"])).days if delivered else None,
+            fraud_score=fraud_check(order["customer_id"], order_id)["risk_score"],
+            refunds_last_90_days=order["refunds_last_90_days"],
+            already_refunded=already_refunded,
+        )
+        failed = rules.evaluate(facts)
+        if failed:
+            return {"status": "refused", "reasons": failed,
+                    "next_step": "call escalate_to_human with these reasons"}
+
+        cur = conn.execute(
+            "INSERT INTO refunds (order_id, amount, status, decided_by, created_at)"
+            " VALUES (?, ?, 'approved', 'agent', ?)",
+            (order_id, amount, today().isoformat()),
+        )
+        conn.execute(
+            "UPDATE customers SET refunds_last_90_days = refunds_last_90_days + 1 WHERE id = ?",
+            (order["customer_id"],),
+        )
+    return {"status": "refunded", "refund_id": cur.lastrowid, "order_id": order_id, "amount": amount}
+
+
+# --- escalate_to_human (WRITE) ------------------------------------------------
+
+class EscalateArgs(BaseModel):
+    reason: str = Field(min_length=5, description="Internal reason for the human reviewer")
+    order_id: int | None = Field(default=None, gt=0, description="The order, if known")
+
+
+def escalate_to_human(reason: str, order_id: int | None = None, case_id: str = "manual") -> dict:
+    """Put the case in the human review queue (the escalations table).
+    case_id is filled in by the loop, not the model, so it can't be mistyped."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO escalations (case_id, order_id, reason, status, created_at)"
+            " VALUES (?, ?, ?, 'open', ?)",
+            (case_id, order_id, reason, datetime.now().isoformat(timespec="seconds")),
+        )
+    return {"status": "escalated", "escalation_id": cur.lastrowid, "case_id": case_id, "reason": reason}
+
+
 # --- registry -----------------------------------------------------------------
 
 # name -> (function, arguments model, description for the model)
@@ -189,7 +268,20 @@ TOOLS = {
         fraud_check, FraudCheckArgs,
         "Get a fraud risk score (0-100) for a refund on this order by this customer, with reasons.",
     ),
+    "create_refund": (
+        create_refund, CreateRefundArgs,
+        "Issue a refund. The shop's rules are checked first; if any fail, the refund is refused "
+        "with the reasons and nothing is paid.",
+    ),
+    "escalate_to_human": (
+        escalate_to_human, EscalateArgs,
+        "Send the case to a human reviewer, with an internal reason. Use when a refund isn't allowed "
+        "automatically or create_refund was refused.",
+    ),
 }
+
+WRITE_TOOLS = {"create_refund", "escalate_to_human"}
+CASE_TOOLS = {"escalate_to_human"}  # tools that get the case_id from the loop
 
 TOOL_SCHEMAS = [
     {
@@ -204,7 +296,7 @@ TOOL_SCHEMAS = [
 ]
 
 
-def run_tool(name: str, raw_arguments: str) -> dict:
+def run_tool(name: str, raw_arguments: str, case_id: str = "manual") -> dict:
     """Validate the model's arguments (a JSON string) and run the tool."""
     if name not in TOOLS:
         raise InvalidToolCall(f"unknown tool {name!r}. Available: {', '.join(TOOLS)}")
@@ -215,7 +307,8 @@ def run_tool(name: str, raw_arguments: str) -> dict:
         errors = "; ".join(f"{'.'.join(map(str, err['loc'])) or 'arguments'}: {err['msg']}"
                            for err in e.errors())
         raise InvalidToolCall(f"invalid arguments for {name}: {errors}") from e
-    return func(**args.model_dump())
+    extra = {"case_id": case_id} if name in CASE_TOOLS else {}
+    return func(**args.model_dump(), **extra)
 
 
 if __name__ == "__main__":

@@ -55,3 +55,11 @@ def test_tools_only_sent_when_given(fake_client):
     llm.chat([], tools=[{"type": "function"}])
     assert "tools" not in requests[0]
     assert requests[1]["tool_choice"] == "auto"
+
+
+def test_error_inside_a_200_response_counts_as_failure(fake_client):
+    # What OpenRouter actually sends when NVIDIA is overloaded: no choices, an error field
+    overloaded = SimpleNamespace(choices=None, error={"message": "Service temporarily overloaded", "code": 503})
+    fake_client([overloaded, response("hello")])
+    assert llm.chat([]).content == "hello"
+    assert llm.stats == {"calls": 2, "failures": 1, "empty": 0}

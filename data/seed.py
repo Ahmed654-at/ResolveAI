@@ -41,6 +41,15 @@ CREATE TABLE refunds (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE escalations (
+    id         INTEGER PRIMARY KEY,
+    case_id    TEXT NOT NULL,
+    order_id   INTEGER REFERENCES orders(id),     -- NULL if the order is unknown
+    reason     TEXT NOT NULL,
+    status     TEXT NOT NULL,                     -- open / approved / rejected
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE agent_logs (
     id        INTEGER PRIMARY KEY,
     case_id   TEXT NOT NULL,
@@ -227,7 +236,7 @@ def build(db_path=DB_PATH, today=None):
 if __name__ == "__main__":
     path = build()
     db = sqlite3.connect(path)
-    for table in ["customers", "orders", "refunds", "agent_logs"]:
+    for table in ["customers", "orders", "refunds", "escalations", "agent_logs"]:
         count = db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"{table:<12} {count:>4} rows")
     print(f"Created {path}")
