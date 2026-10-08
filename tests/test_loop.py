@@ -136,4 +136,126 @@ def test_step_limit_escalates(test_db, monkeypatch):
     fake_model(monkeypatch, replies)
     result = loop.run_case("refund", verbose=False)
     assert (result["outcome"], result["reason"]) == ("escalated", "step limit reached")
-    assert result["model_calls"] == loop.MAX_MODEL_CALLS
+    assert result["steps"] == loop.MAX_STEPS
+
+
+# --- loop detection -----------------------------------------------------------
+
+def test_same_call_twice_in_a_row_is_a_loop(test_db, monkeypatch):
+    fake_model(monkeypatch, [
+        tool_reply("lookup_order", '{"order_id": 1}'),
+        tool_reply("lookup_order", '{"order_id": 1}'),
+    ])
+    result = loop.run_case("refund", verbose=False)
+    assert (result["outcome"], result["reason"]) == ("escalated", "loop detected")
+    assert result["steps"] == 2
+
+
+def test_key_order_does_not_hide_a_loop(test_db, monkeypatch):
+    fake_model(monkeypatch, [
+        tool_reply("fraud_check", '{"customer_id": 1, "order_id": 1}'),
+        tool_reply("fraud_check", '{"order_id": 1, "customer_id": 1}'),
+    ])
+    assert loop.run_case("refund", verbose=False)["reason"] == "loop detected"
+
+
+def test_same_tool_with_different_arguments_is_not_a_loop(test_db, monkeypatch):
+    fake_model(monkeypatch, [
+        tool_reply("search_refund_policy", '{"question": "refund window"}'),
+        tool_reply("search_refund_policy", '{"question": "refund amount"}'),
+        tool_reply("create_refund", '{"order_id": 1, "amount": 40}'),
+        text_reply("Refunded."),
+    ])
+    assert loop.run_case("refund", verbose=False)["outcome"] == "refunded"
+
+
+# --- logging ------------------------------------------------------------------
+
+def log_rows(db_path, case_id):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT step, event, tool_name, input, output FROM agent_logs WHERE case_id = ? ORDER BY id",
+            (case_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_every_step_is_logged(test_db, monkeypatch):
+    fake_model(monkeypatch, [
+        tool_reply("lookup_order", '{"order_id": 1}'),
+        tool_reply("create_refund", '{"order_id": 1, "amount": 40}'),
+        text_reply("Refunded."),
+    ])
+    loop.run_case("refund order 1", verbose=False, case_id="case-log")
+    rows = log_rows(test_db, "case-log")
+
+    assert [(r[0], r[1], r[2]) for r in rows] == [
+        (0, "start", None),
+        (1, "tool", "lookup_order"),
+        (2, "tool", "create_refund"),
+        (3, "reply", None),
+        (3, "decision", None),
+    ]
+    assert rows[0][3] == "refund order 1"
+    assert "Wireless Headphones" in rows[1][4]
+    decision = json.loads(rows[-1][4])
+    assert decision["outcome"] == "refunded"
+    assert decision["steps"] == 3
+    assert decision["seconds"] >= 0
+
+
+def test_auto_escalation_and_model_error_are_logged(test_db, monkeypatch):
+    fake_model(monkeypatch, [llm.ModelUnavailable("429 rate limited")])
+    loop.run_case("refund", verbose=False, case_id="case-err")
+    rows = log_rows(test_db, "case-err")
+
+    assert [r[1] for r in rows] == ["start", "error", "decision"]
+    assert "429" in rows[1][4]
+    assert json.loads(rows[2][4])["reason"] == "model unavailable"
+
+
+def test_logging_failure_does_not_crash_the_case(test_db, monkeypatch):
+    conn = sqlite3.connect(test_db)
+    conn.execute("DROP TABLE agent_logs")  # every log write will now fail
+    conn.commit()
+    conn.close()
+    fake_model(monkeypatch, [
+        tool_reply("create_refund", '{"order_id": 1, "amount": 40}'),
+        text_reply("Refunded."),
+    ])
+    assert loop.run_case("refund", verbose=False)["outcome"] == "refunded"
+
+
+def test_case_viewer(test_db, monkeypatch, capsys):
+    from agent import logger
+    fake_model(monkeypatch, [
+        tool_reply("create_refund", '{"order_id": 1, "amount": 40}'),
+        text_reply("Refunded."),
+    ])
+    loop.run_case("refund", verbose=False, case_id="case-view")
+    logger.print_case()  # no id: latest case
+    out = capsys.readouterr().out
+    assert "case-view" in out
+    assert "tool: create_refund" in out
+
+
+# --- needs_info ---------------------------------------------------------------
+
+def test_no_order_found_asks_customer_instead_of_escalating(test_db, monkeypatch):
+    fake_model(monkeypatch, [text_reply("Could you give me your order number?")])
+    result = loop.run_case("I want to refund my order", verbose=False)
+
+    assert (result["outcome"], result["reason"]) == ("needs_info", "order not identified")
+    assert result["answer"] == "Could you give me your order number?"
+    assert escalations(test_db) == []  # nothing for humans to review
+
+
+def test_unknown_order_number_also_needs_info(test_db, monkeypatch):
+    fake_model(monkeypatch, [
+        tool_reply("lookup_order", '{"order_id": 999}'),
+        text_reply("I couldn't find order 999. Could you check the number?"),
+    ])
+    assert loop.run_case("refund order 999", verbose=False)["outcome"] == "needs_info"
+    assert escalations(test_db) == []

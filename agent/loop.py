@@ -5,12 +5,14 @@ Run one case:  python -m agent.loop "Hi, I want a refund for order 1"
 
 import json
 import sys
+import time
 import uuid
 from datetime import date, datetime
 
 from agent import llm, tools
+from agent.logger import log
 
-MAX_MODEL_CALLS = 10  # simple safety cap for now; full step limit + loop detection come in step 6
+MAX_STEPS = 10  # model calls per case; after that the case is escalated
 
 SYSTEM_PROMPT = f"""You are ResolveAI, the refund agent for an online shop. Today is {date.today().isoformat()}.
 
@@ -44,32 +46,42 @@ def new_case_id():
 def run_case(message: str, verbose: bool = True, case_id: str | None = None) -> dict:
     """Work one customer message to the end. Always returns a result dict, never raises.
 
-    outcome is "refunded" or "escalated", taken from what the tools actually did,
+    outcome is "refunded", "escalated" or "needs_info" (no order found; the reply asks for it),
+    taken from what the tools actually did,
     not from what the model says.
     """
     say = print if verbose else (lambda *a, **k: None)
     case = {
         "case_id": case_id or new_case_id(),
-        "decision": None,   # set when create_refund succeeds or escalate_to_human runs
+        "decision": None,    # set when create_refund succeeds or escalate_to_human runs
         "reason": None,
-        "order_id": None,   # remembered from lookup_order, for the escalation queue
+        "order_id": None,    # remembered from lookup_order, for the escalation queue
+        "last_call": None,   # (tool, arguments) of the previous tool call, for loop detection
+        "started": time.perf_counter(),
     }
+    log(case["case_id"], 0, "start", input=message)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": message},
     ]
     retried_invalid_args = False
 
-    for step in range(1, MAX_MODEL_CALLS + 1):
+    for step in range(1, MAX_STEPS + 1):
         try:
             reply = llm.chat(messages, tools.TOOL_SCHEMAS)
         except llm.ModelUnavailable as e:
+            log(case["case_id"], step, "error", output=str(e))
             return finish(case, step, say, auto_escalate="model unavailable", detail=str(e))
 
         # No tool calls means the model is done: its text is the customer reply
         if not reply.tool_calls:
             say(f"[{step}] reply to customer:\n{reply.content}")
-            if case["decision"] is None:
+            log(case["case_id"], step, "reply", output=reply.content)
+            if case["decision"] is None and case["order_id"] is None:
+                # No order found yet (e.g. "I want to refund my order"): the reply asks the customer
+                # for details. Nothing to refund or review, so don't fill the human queue.
+                case["decision"], case["reason"] = "needs_info", "order not identified"
+            elif case["decision"] is None:
                 return finish(case, step, say, answer=reply.content, auto_escalate="no decision made")
             return finish(case, step, say, answer=reply.content)
 
@@ -85,23 +97,41 @@ def run_case(message: str, verbose: bool = True, case_id: str | None = None) -> 
         })
 
         for call in reply.tool_calls:
-            name = call.function.name
-            say(f"[{step}] tool call: {name}({call.function.arguments})")
+            name, arguments = call.function.name, call.function.arguments
+            say(f"[{step}] tool call: {name}({arguments})")
+
+            this_call = (name, normalize(arguments))
+            if this_call == case["last_call"]:
+                return finish(case, step, say, auto_escalate="loop detected",
+                              detail=f"{name} called twice in a row with {arguments}")
+            case["last_call"] = this_call
+
             if name in tools.WRITE_TOOLS and case["decision"]:
                 output = {"error": f"this case is already {case['decision']}; no further decisions allowed"}
             else:
                 try:
-                    output = tools.run_tool(name, call.function.arguments, case_id=case["case_id"])
+                    output = tools.run_tool(name, arguments, case_id=case["case_id"])
                 except tools.InvalidToolCall as e:
+                    log(case["case_id"], step, "tool", name, input=arguments, output={"error": str(e)})
                     if retried_invalid_args:
                         return finish(case, step, say, auto_escalate="invalid tool arguments", detail=str(e))
                     retried_invalid_args = True  # one chance to fix it
                     output = {"error": f"{e}. Fix the arguments and call the tool again."}
+                else:
+                    log(case["case_id"], step, "tool", name, input=arguments, output=output)
                 record_decision(case, name, output)
             say(f"     result: {output}")
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(output)})
 
-    return finish(case, MAX_MODEL_CALLS, say, auto_escalate="step limit reached")
+    return finish(case, MAX_STEPS, say, auto_escalate="step limit reached")
+
+
+def normalize(arguments):
+    """Same arguments in a different key order should count as the same call."""
+    try:
+        return json.dumps(json.loads(arguments), sort_keys=True)
+    except (json.JSONDecodeError, TypeError):
+        return arguments
 
 
 def record_decision(case, tool_name, output):
@@ -116,20 +146,24 @@ def record_decision(case, tool_name, output):
 
 
 def finish(case, step, say, answer=None, auto_escalate=None, detail=None):
-    """Build the result. If no decision was made, the loop escalates the case itself,
-    so no case is ever left without a decision."""
+    """Build the result and log the decision. If no decision was made, the loop escalates
+    the case itself, so no case is ever left without a decision."""
     if auto_escalate and case["decision"] is None:
         tools.escalate_to_human(auto_escalate, order_id=case["order_id"], case_id=case["case_id"])
         case["decision"], case["reason"] = "escalated", auto_escalate
         say(f"[{step}] AUTO-ESCALATED: {auto_escalate}" + (f" ({detail})" if detail else ""))
-    return {
+    result = {
         "case_id": case["case_id"],
         "outcome": case["decision"],
         "reason": case["reason"],
         "detail": detail,
         "answer": answer,
-        "model_calls": step,
+        "steps": step,
+        "seconds": round(time.perf_counter() - case["started"], 2),
     }
+    log(case["case_id"], step, "decision",
+        output={k: result[k] for k in ("outcome", "reason", "detail", "steps", "seconds")})
+    return result
 
 
 if __name__ == "__main__":
@@ -140,4 +174,5 @@ if __name__ == "__main__":
     result = run_case(message)
     print(f"\nCase {result['case_id']}: {result['outcome'].upper()}"
           + (f" ({result['reason']})" if result["reason"] else ""))
-    print(f"Model stats: {llm.stats}")
+    print(f"Steps: {result['steps']}, time: {result['seconds']}s, model stats: {llm.stats}")
+    print(f"Full log: python -m agent.logger {result['case_id']}")

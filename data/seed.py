@@ -54,7 +54,8 @@ CREATE TABLE agent_logs (
     id        INTEGER PRIMARY KEY,
     case_id   TEXT NOT NULL,
     step      INTEGER NOT NULL,
-    tool_name TEXT,
+    event     TEXT NOT NULL,                      -- start / tool / reply / decision / error / human
+    tool_name TEXT,                               -- only for event = 'tool'
     input     TEXT,
     output    TEXT,
     timestamp TEXT NOT NULL

@@ -133,7 +133,7 @@ pytest                           # run tests
 - [x] 3. First tool, `lookup_order`, plus a minimal agent loop that can call it
 - [x] 4. The other read tools
 - [x] 5. `rules.py` and `create_refund` / `escalate_to_human`
-- [ ] 6. Step limit, loop detection, logging
-- [ ] 7. Streamlit dashboard
+- [x] 6. Step limit, loop detection, logging
+- [x] 7. Streamlit dashboard
 - [ ] 8. 20+ eval cases and `run_evals.py`
 - [ ] 9. README with the eval results and a demo GIF
